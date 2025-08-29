@@ -23,9 +23,11 @@ struct Args {
     accounts: String,
     #[clap(long)]
     with_add_accounts: bool,
+    #[clap(long)]
+    cap_accounts_count: Option<usize>,
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::main(flavor = "multi_thread")]
 async fn main() {
     env_logger::builder()
         .format_timestamp(Some(env_logger::TimestampPrecision::Micros))
@@ -40,11 +42,17 @@ async fn main() {
         rpc_url,
         accounts,
         with_add_accounts,
+        cap_accounts_count,
     } = Args::parse();
 
     let (endpoint, x_token) = extract_address_and_access_token(&rpc_url);
 
-    let keys = load_accounts(&accounts);
+    let mut keys = load_accounts(&accounts);
+
+    if let Some(cap_accounts_count) = cap_accounts_count {
+        log::info!("Truncate keys");
+        keys.truncate(cap_accounts_count);
+    }
 
     let (update_oneof_notifications_sender, mut update_oneof_notifications_receiver) =
         unbounded_channel::<UpdateOneofNotifications>();

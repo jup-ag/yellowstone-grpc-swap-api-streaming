@@ -1,10 +1,15 @@
 use anyhow::Result;
-use futures::{SinkExt, StreamExt, TryStreamExt, future::join_all, stream::TryReadyChunksError};
+use futures::{
+    SinkExt, StreamExt, TryStreamExt,
+    future::join_all,
+    stream::{FuturesUnordered, TryReadyChunksError},
+};
 use solana_sdk::{
     account::Account, clock::Slot, commitment_config::CommitmentLevel, pubkey::Pubkey,
 };
 use std::{
-    collections::{HashMap, HashSet},
+    cmp::Reverse,
+    collections::{BinaryHeap, HashMap, HashSet},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -106,20 +111,21 @@ pub async fn geyser_subscribe_accounts_loop(
 
     log::info!("Starting geyser client with accounts chunk size: {chunk_size}");
 
-    join_all(chunked_keys.into_iter().enumerate().map(|(idx, keys)| {
-        geyser_accounts_streamer_loop(
-            idx,
-            endpoint.clone(),
-            x_token.clone(),
-            compression_encoding,
-            keys,
-            enable_ping,
-            &geyser_accounts_update_sender,
-            &update_oneof_notifications_sender,
-            slot_tracker.clone(),
-        )
-    }))
-    .await;
+    let futures_unordered =
+        FuturesUnordered::from_iter(chunked_keys.into_iter().enumerate().map(|(idx, keys)| {
+            geyser_accounts_streamer_loop(
+                idx,
+                endpoint.clone(),
+                x_token.clone(),
+                compression_encoding,
+                keys,
+                enable_ping,
+                &geyser_accounts_update_sender,
+                &update_oneof_notifications_sender,
+                slot_tracker.clone(),
+            )
+        }));
+    futures_unordered.collect::<Vec<_>>().await;
 }
 
 pub const SUBSCRIBE_ACCOUNTS_CHUNK_SIZE: usize = 10_000;
@@ -144,6 +150,8 @@ fn connect(
             .accept_compressed(compression_encoding)
             .send_compressed(compression_encoding);
     }
+    builder = builder.http2_adaptive_window(true); // Dynamic window sizing
+
     builder.connect_lazy().map_err(Into::into)
 }
 
@@ -197,20 +205,22 @@ impl PingService {
         }
     }
 
-    fn should_send(&mut self) -> Option<i32> {
+    fn should_send(&self) -> bool {
         match self.ping_status {
             PingStatus::Waiting(instant) => {
                 if instant.elapsed() > Self::WAITING_DURATION {
-                    self.id += 1;
-
-                    self.ping_status = PingStatus::Sent(Instant::now());
-                    Some(self.id)
+                    true
                 } else {
-                    None
+                    false
                 }
             }
-            PingStatus::Sent(_) => None,
+            PingStatus::Sent(_) => false,
         }
+    }
+
+    fn start_next_ping(&mut self) -> i32 {
+        self.ping_status = PingStatus::Sent(Instant::now());
+        self.id
     }
 
     fn handle_pong(&mut self, idx: usize, subscribe_update_pong: SubscribeUpdatePong) {
@@ -224,7 +234,7 @@ impl PingService {
             PingStatus::Sent(instant) => {
                 if self.id == subscribe_update_pong.id {
                     log::info!(
-                        "idx={idx} Pong {} received after: {:?}",
+                        "idx={idx} Pong {} received after: {:.3?}",
                         self.id,
                         instant.elapsed()
                     );
@@ -239,6 +249,62 @@ impl PingService {
             }
         }
     }
+}
+
+struct AccountMetrics {
+    started_at: Instant,
+    address_to_updates_and_bytes: HashMap<Pubkey, (usize, usize)>,
+}
+
+impl AccountMetrics {
+    const DURATION: Duration = Duration::from_secs(10);
+
+    fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            address_to_updates_and_bytes: HashMap::default(),
+        }
+    }
+
+    fn update(&mut self, idx: usize, address: Pubkey, data_len: usize) {
+        let (count, total_data_len) = self
+            .address_to_updates_and_bytes
+            .entry(address)
+            .or_default();
+        *count += 1;
+        *total_data_len += data_len;
+
+        if self.started_at.elapsed() > Self::DURATION {
+            let top_n = top_n_by_total_data_len_heap(&self.address_to_updates_and_bytes, 10);
+            log::info!("idx={idx} top_n_by_total_data_len: {top_n:?}");
+
+            *self = Self::new();
+        }
+    }
+}
+
+fn top_n_by_total_data_len_heap(
+    map: &HashMap<Pubkey, (usize, usize)>,
+    n: usize,
+) -> Vec<(Pubkey, (usize, usize))> {
+    let mut heap: BinaryHeap<Reverse<(usize, Pubkey, usize)>> = BinaryHeap::new();
+    // store as (total_len, address, count) in Reverse so it becomes a min-heap
+
+    for (addr, (count, total_len)) in map {
+        heap.push(Reverse((*total_len, *addr, *count)));
+        if heap.len() > n {
+            heap.pop(); // remove smallest
+        }
+    }
+
+    // Convert back
+    let mut result: Vec<_> = heap
+        .into_iter()
+        .map(|Reverse((total_len, addr, count))| (addr, (count, total_len)))
+        .collect();
+    // Optional: sort descending for final output
+    result.sort_by_key(|&(_, (_, total_len))| std::cmp::Reverse(total_len));
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -281,6 +347,7 @@ async fn geyser_accounts_streamer_loop(
 
     let mut streamer_metrics = StreamerMetrics::new();
     let mut ping_service = PingService::new();
+    let mut account_metrics = AccountMetrics::new();
 
     loop {
         if !first_try {
@@ -394,9 +461,10 @@ async fn geyser_accounts_streamer_loop(
                                     let client_account_filter_account_len = client_account_filter.account.len();
 
                                     // resub
+                                    let accounts = account_filter_map.clone();
                                     match cloned_subscribe_request_sink.lock().await
                                         .send(SubscribeRequest {
-                                            accounts: account_filter_map.clone(),
+                                            accounts,
                                             slots: slots.clone(),
                                             ..Default::default()
                                         })
@@ -450,6 +518,7 @@ async fn geyser_accounts_streamer_loop(
                     &mut slot_comparison_instant,
                     &mut streamer_metrics,
                     &mut ping_service,
+                    &mut account_metrics,
                 );
                 ping_received |= has_ping;
 
@@ -484,10 +553,16 @@ async fn geyser_accounts_streamer_loop(
                 }
             }
 
-            if let Some(id) = ping_service.should_send() {
-                match subscribe_request_sink
-                    .lock()
-                    .await
+            if ping_service.should_send() {
+                let lock_guard_at = Instant::now();
+                let mut sink = subscribe_request_sink.lock().await;
+                let elapsed = lock_guard_at.elapsed();
+                if elapsed > Duration::from_millis(100) {
+                    log::warn!("Took some time to lock: {elapsed:?}");
+                }
+
+                let id = ping_service.start_next_ping();
+                match sink
                     .send(SubscribeRequest {
                         ping: Some(SubscribeRequestPing { id }),
                         ..Default::default()
@@ -515,6 +590,7 @@ fn handle_subscribe_update(
     slot_comparison_instant: &mut Option<Instant>,
     streamer_metrics: &mut StreamerMetrics,
     ping_service: &mut PingService,
+    account_metrics: &mut AccountMetrics,
 ) -> (Option<UpdateOneofNotification>, bool) {
     let mut ping_received = false;
 
@@ -528,6 +604,11 @@ fn handle_subscribe_update(
             let account_pretty: AccountPretty = subscribe_update_account.into();
 
             streamer_metrics.sum_account_data_len += account_pretty.account.data.len();
+            // account_metrics.update(
+            //     idx,
+            //     account_pretty.pubkey,
+            //     account_pretty.account.data.len(),
+            // );
 
             streamer_metrics.update(idx);
             Some(UpdateOneofNotification::Account(account_pretty))
